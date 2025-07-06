@@ -1,17 +1,21 @@
 #!/bin/bash
 
 # V2Ray Proxy Tester - نصب و راه‌اندازی
-# این اسکریپت تمام ابزارهای لازم را نصب می‌کند
+# نسخه اصلاح‌شده با پشتیبانی از VLESS, Trojan, SS و رفع باگ‌ها
 
-echo "=== نصب V2Ray Proxy Tester ==="
+echo "=== نصب V2Ray Proxy Tester (نسخه اصلاح‌شده) ==="
 
 # بروزرسانی سیستم
 echo "بروزرسانی سیستم..."
 sudo apt update && sudo apt upgrade -y
 
 # نصب ابزارهای مورد نیاز
-echo "نصب ابزارهای مورد نیاز..."
+echo "نصب ابزارهای مورد نیاز (شامل curl, wget, jq, python3, pip, cron)..."
 sudo apt install -y curl wget jq python3 python3-pip cron
+
+# نصب وابستگی پایتون برای پشتیبانی از SOCKS
+echo "نصب وابستگی SOCKS برای پایتون..."
+pip3 install "requests[socks]"
 
 # نصب V2Ray
 echo "نصب V2Ray..."
@@ -21,7 +25,7 @@ bash <(curl -L https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/
 mkdir -p ~/v2ray-tester
 cd ~/v2ray-tester
 
-# دانلود اسکریپت تست پروکسی
+# دانلود اسکریپت تست پروکسی (نسخه اصلاح شده)
 cat > test_proxies.py << 'EOF'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -34,289 +38,275 @@ import subprocess
 import time
 import os
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import tempfile
 import signal
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-class V2RayTester:
-    def __init__(self):
-        self.subscription_urls = [
-            "https://raw.githubusercontent.com/Kolandone/v2raycollector/main/config.txt",
-            "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/refs/heads/main/all_configs.txt",
-            "https://raw.githubusercontent.com/V2RayRoot/V2RayConfig/refs/heads/main/Config/shadowsocks.txt",
-            "https://raw.githubusercontent.com/lagzian/SS-Collector/main/vmess.txt"
-        ]
-        self.working_proxies = []
-        self.v2ray_process = None
-        self.temp_config_file = None
-        
-    def fetch_proxy_lists(self):
-        """دریافت لیست پروکسی‌ها از URLهای مختلف"""
-        all_proxies = []
-        
-        for url in self.subscription_urls:
-            try:
-                print(f"دریافت از: {url}")
-                response = requests.get(url, timeout=30)
-                response.raise_for_status()
-                
-                # تلاش برای decode کردن base64
-                try:
-                    decoded_content = base64.b64decode(response.text).decode('utf-8')
-                    proxies = decoded_content.strip().split('\n')
-                except:
-                    # اگر base64 نبود، مستقیم استفاده کن
-                    proxies = response.text.strip().split('\n')
-                
-                # فیلتر کردن لینک‌های خالی و نامعتبر
-                valid_proxies = []
-                for proxy in proxies:
-                    proxy = proxy.strip()
-                    if proxy and (proxy.startswith('vmess://') or 
-                                proxy.startswith('vless://') or 
-                                proxy.startswith('trojan://') or 
-                                proxy.startswith('ss://')):
-                        valid_proxies.append(proxy)
-                
-                all_proxies.extend(valid_proxies)
-                print(f"تعداد پروکسی دریافت شده: {len(valid_proxies)}")
-                
-            except Exception as e:
-                print(f"خطا در دریافت {url}: {e}")
-        
-        # حذف تکراری‌ها
-        unique_proxies = list(set(all_proxies))
-        print(f"تعداد کل پروکسی‌های یکتا: {len(unique_proxies)}")
-        return unique_proxies
-    
-    def parse_vmess(self, vmess_url):
-        """تجزیه VMess URL"""
+# --- کانفیگ‌های اصلی ---
+SUBSCRIPTION_URLS = [
+    "https://raw.githubusercontent.com/Kolandone/v2raycollector/main/config.txt",
+    "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/refs/heads/main/all_configs.txt",
+    "https://raw.githubusercontent.com/V2RayRoot/V2RayConfig/refs/heads/main/Config/shadowsocks.txt",
+    "https://raw.githubusercontent.com/lagzian/SS-Collector/main/vmess.txt"
+]
+CONNECTION_TIMEOUT = 10  # ثانیه
+MAX_WORKERS = 20         # تعداد تست‌های همزمان
+TEST_URL = 'http://www.google.com' # استفاده از http برای جلوگیری از مشکلات SSL در تست
+LOCAL_SOCKS_PORT = 1080
+
+def fetch_proxy_lists(urls):
+    """دریافت لیست پروکسی‌ها از URLهای مختلف"""
+    all_proxies = []
+    for url in urls:
         try:
-            if not vmess_url.startswith('vmess://'):
-                return None
+            print(f"دریافت از: {url}")
+            response = requests.get(url, timeout=30)
+            response.raise_for_status()
             
-            encoded_data = vmess_url[8:]  # حذف vmess://
-            decoded_data = base64.b64decode(encoded_data).decode('utf-8')
-            vmess_data = json.loads(decoded_data)
+            content = response.text
+            try:
+                if len(content) % 4 != 0:
+                    content += '=' * (4 - len(content) % 4)
+                decoded_content = base64.b64decode(content).decode('utf-8')
+                proxies = decoded_content.strip().split('\n')
+            except Exception:
+                proxies = content.strip().split('\n')
             
-            return {
-                "protocol": "vmess",
-                "address": vmess_data.get("add"),
-                "port": int(vmess_data.get("port", 0)),
-                "id": vmess_data.get("id"),
-                "aid": int(vmess_data.get("aid", 0)),
-                "net": vmess_data.get("net", "tcp"),
-                "type": vmess_data.get("type", "none"),
-                "host": vmess_data.get("host", ""),
-                "path": vmess_data.get("path", ""),
-                "tls": vmess_data.get("tls", ""),
-                "ps": vmess_data.get("ps", "")
-            }
+            valid_proxies = [p.strip() for p in proxies if p.strip().startswith(('vmess://', 'vless://', 'trojan://', 'ss://'))]
+            all_proxies.extend(valid_proxies)
+            print(f"تعداد پروکسی دریافت شده: {len(valid_proxies)}")
         except Exception as e:
-            print(f"خطا در تجزیه VMess: {e}")
-            return None
+            print(f"خطا در دریافت {url}: {e}")
     
-    def create_v2ray_config(self, proxy_config):
-        """ساخت فایل کانفیگ V2Ray"""
-        if proxy_config["protocol"] == "vmess":
-            outbound = {
-                "protocol": "vmess",
-                "settings": {
-                    "vnext": [{
-                        "address": proxy_config["address"],
-                        "port": proxy_config["port"],
-                        "users": [{
-                            "id": proxy_config["id"],
-                            "aid": proxy_config["aid"]
-                        }]
-                    }]
-                },
-                "streamSettings": {
-                    "network": proxy_config["net"]
-                }
-            }
-            
-            # اضافه کردن تنظیمات شبکه
-            if proxy_config["net"] == "ws":
-                outbound["streamSettings"]["wsSettings"] = {
-                    "path": proxy_config["path"],
-                    "headers": {"Host": proxy_config["host"]} if proxy_config["host"] else {}
-                }
-            elif proxy_config["net"] == "h2":
-                outbound["streamSettings"]["httpSettings"] = {
-                    "path": proxy_config["path"],
-                    "host": [proxy_config["host"]] if proxy_config["host"] else []
-                }
-            
-            # تنظیمات TLS
-            if proxy_config["tls"] == "tls":
-                outbound["streamSettings"]["security"] = "tls"
-                outbound["streamSettings"]["tlsSettings"] = {
-                    "serverName": proxy_config["host"] if proxy_config["host"] else proxy_config["address"]
-                }
+    unique_proxies = sorted(list(set(all_proxies)))
+    print(f"تعداد کل پروکسی‌های یکتا: {len(unique_proxies)}")
+    return unique_proxies
+
+def parse_proxy_url(proxy_url):
+    """تجزیه انواع URLهای پروکسی"""
+    if proxy_url.startswith('vmess://'):
+        return parse_vmess(proxy_url)
+    elif proxy_url.startswith('vless://'):
+        return parse_vless(proxy_url)
+    elif proxy_url.startswith('trojan://'):
+        return parse_trojan(proxy_url)
+    elif proxy_url.startswith('ss://'):
+        return parse_ss(proxy_url)
+    return None
+
+def parse_vmess(vmess_url):
+    try:
+        decoded_data = base64.b64decode(vmess_url[8:]).decode('utf-8')
+        config = json.loads(decoded_data)
+        return {
+            "protocol": "vmess", "ps": config.get("ps"), "port": int(config.get("port")),
+            "address": config.get("add"), "id": config.get("id"), "aid": config.get("aid", 0),
+            "net": config.get("net"), "type": config.get("type"), "host": config.get("host"),
+            "path": config.get("path"), "tls": config.get("tls")
+        }
+    except Exception: return None
+
+def parse_vless(vless_url):
+    try:
+        parts = urllib.parse.urlparse(vless_url)
+        params = urllib.parse.parse_qs(parts.query)
+        return {
+            "protocol": "vless", "ps": urllib.parse.unquote(parts.fragment) if parts.fragment else parts.netloc,
+            "port": int(parts.port), "address": parts.hostname, "id": parts.username,
+            "net": params.get("type", ["tcp"])[0], "security": params.get("security", ["none"])[0],
+            "path": params.get("path", [""])[0], "host": params.get("host", [parts.hostname])[0],
+            "sni": params.get("sni", [parts.hostname])[0]
+        }
+    except Exception: return None
+
+def parse_trojan(trojan_url):
+    try:
+        parts = urllib.parse.urlparse(trojan_url)
+        params = urllib.parse.parse_qs(parts.query)
+        return {
+            "protocol": "trojan", "ps": urllib.parse.unquote(parts.fragment) if parts.fragment else parts.netloc,
+            "port": int(parts.port), "address": parts.hostname, "password": parts.username,
+            "sni": params.get("sni", [parts.hostname])[0]
+        }
+    except Exception: return None
+
+def parse_ss(ss_url):
+    try:
+        if '#' in ss_url:
+            main_part, fragment = ss_url[5:].split('#', 1)
+            ps = urllib.parse.unquote(fragment)
         else:
-            return None
+            main_part = ss_url[5:]
+            ps = 'Unknown'
+
+        if '@' in main_part:
+            decoded_part = base64.b64decode(main_part.split('@')[0] + '==').decode('utf-8')
+            method, password = decoded_part.split(':')
+            address, port = main_part.split('@')[1].split(':')
+        else:
+            decoded_part = base64.b64decode(main_part + '==').decode('utf-8')
+            method, password, address, port = decoded_part.replace('@', ':').split(':')
         
-        config = {
-            "log": {"loglevel": "warning"},
-            "inbounds": [{
-                "port": 1080,
-                "protocol": "socks",
-                "settings": {"udp": True}
-            }],
-            "outbounds": [outbound, {"protocol": "freedom", "tag": "direct"}],
-            "routing": {
-                "rules": [{
-                    "type": "field",
-                    "outboundTag": "direct",
-                    "domain": ["geosite:private"]
-                }]
-            }
+        return {
+            "protocol": "shadowsocks", "ps": ps, "port": int(port),
+            "address": address, "password": password, "method": method
+        }
+    except Exception: return None
+
+def create_v2ray_config(proxy_config):
+    """ساخت فایل کانفیگ V2Ray برای پروتکل‌های مختلف"""
+    if not proxy_config: return None
+    
+    outbound = {"protocol": proxy_config["protocol"], "settings": {}, "streamSettings": {}}
+    
+    if proxy_config["protocol"] == "vmess":
+        outbound["settings"]["vnext"] = [{"address": proxy_config["address"], "port": proxy_config["port"], "users": [{"id": proxy_config["id"], "alterId": proxy_config["aid"]}]}]
+        outbound["streamSettings"]["network"] = proxy_config.get("net", "tcp")
+        if proxy_config.get("net") == "ws":
+            outbound["streamSettings"]["wsSettings"] = {"path": proxy_config.get("path", ""), "headers": {"Host": proxy_config.get("host", "")}}
+        if proxy_config.get("tls") == "tls":
+            outbound["streamSettings"]["security"] = "tls"
+            outbound["streamSettings"]["tlsSettings"] = {"serverName": proxy_config.get("host", proxy_config["address"])}
+
+    elif proxy_config["protocol"] == "vless":
+        outbound["settings"]["vnext"] = [{"address": proxy_config["address"], "port": proxy_config["port"], "users": [{"id": proxy_config["id"], "flow": "xtls-rprx-direct"}]}]
+        outbound["streamSettings"]["network"] = proxy_config.get("net", "tcp")
+        if proxy_config.get("security") == "tls":
+            outbound["streamSettings"]["security"] = "tls"
+            outbound["streamSettings"]["tlsSettings"] = {"serverName": proxy_config.get("sni", proxy_config["address"])}
+        if proxy_config.get("net") == "ws":
+            outbound["streamSettings"]["wsSettings"] = {"path": proxy_config.get("path", ""), "headers": {"Host": proxy_config.get("host", "")}}
+            
+    elif proxy_config["protocol"] == "trojan":
+        outbound["settings"]["servers"] = [{"address": proxy_config["address"], "port": proxy_config["port"], "password": proxy_config["password"]}]
+        outbound["streamSettings"]["security"] = "tls"
+        outbound["streamSettings"]["tlsSettings"] = {"serverName": proxy_config.get("sni", proxy_config["address"])}
+
+    elif proxy_config["protocol"] == "shadowsocks":
+        outbound["settings"]["servers"] = [{"address": proxy_config["address"], "port": proxy_config["port"], "password": proxy_config["password"], "method": proxy_config["method"]}]
+
+    else:
+        return None
+
+    return {
+        "log": {"loglevel": "warning"},
+        "inbounds": [{"port": LOCAL_SOCKS_PORT, "listen": "127.0.0.1", "protocol": "socks", "settings": {"auth": "noauth", "udp": True}}],
+        "outbounds": [outbound]
+    }
+
+def test_proxy_connection(proxy_url, timeout):
+    """تست اتصال یک پروکسی"""
+    proxy_config = parse_proxy_url(proxy_url)
+    if not proxy_config:
+        return False, "خطا در تجزیه URL", None
+
+    v2ray_config = create_v2ray_config(proxy_config)
+    if not v2ray_config:
+        return False, f"ساخت کانفیگ برای پروتکل '{proxy_config.get('protocol')}' ناموفق بود", None
+
+    tmp_config_file = None
+    process = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as f:
+            json.dump(v2ray_config, f, indent=2)
+            tmp_config_file = f.name
+
+        cmd = ['v2ray', 'run', '-c', tmp_config_file]
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, preexec_fn=os.setsid)
+        time.sleep(2) # زمان برای بالا آمدن v2ray
+
+        proxies = {
+            'http': f'socks5h://127.0.0.1:{LOCAL_SOCKS_PORT}',
+            'https': f'socks5h://127.0.0.1:{LOCAL_SOCKS_PORT}'
         }
         
-        return config
-    
-    def test_proxy_connection(self, proxy_url, timeout=10):
-        """تست اتصال یک پروکسی"""
-        try:
-            # تجزیه URL پروکسی
-            if proxy_url.startswith('vmess://'):
-                proxy_config = self.parse_vmess(proxy_url)
-                if not proxy_config:
-                    return False, "خطا در تجزیه VMess", None
-            else:
-                return False, "پروتکل پشتیبانی نمی‌شود", None
-            
-            # ساخت فایل کانفیگ
-            v2ray_config = self.create_v2ray_config(proxy_config)
-            if not v2ray_config:
-                return False, "خطا در ساخت کانفیگ", None
-            
-            # نوشتن کانفیگ در فایل موقت
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-                json.dump(v2ray_config, f, indent=2)
-                config_file = f.name
-            
+        start_time = time.time()
+        response = requests.get(TEST_URL, proxies=proxies, timeout=timeout)
+        end_time = time.time()
+
+        if response.status_code == 200:
+            delay = round((end_time - start_time) * 1000)
+            return True, f"تاخیر: {delay}ms", delay
+        else:
+            return False, f"کد وضعیت: {response.status_code}", None
+
+    except requests.exceptions.RequestException as e:
+        error_message = str(e)
+        if "SOCKS" in error_message:
+            return False, "خطای اتصال SOCKS", None
+        elif "timed out" in error_message.lower():
+            return False, "تایم اوت", None
+        return False, "خطای اتصال", None
+    except Exception as e:
+        return False, f"خطای نامشخص: {e}", None
+    finally:
+        if process:
             try:
-                # راه‌اندازی V2Ray
-                process = subprocess.Popen(
-                    ['v2ray', 'run', '-c', config_file],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    preexec_fn=os.setsid
-                )
-                
-                # انتظار برای راه‌اندازی
-                time.sleep(2)
-                
-                # تست اتصال
-                start_time = time.time()
-                test_response = requests.get(
-                    'https://www.google.com',
-                    proxies={'http': 'socks5://127.0.0.1:1080', 'https': 'socks5://127.0.0.1:1080'},
-                    timeout=timeout
-                )
-                end_time = time.time()
-                
-                if test_response.status_code == 200:
-                    delay = round((end_time - start_time) * 1000, 2)  # به میلی‌ثانیه
-                    return True, f"تاخیر: {delay}ms", delay
-                else:
-                    return False, f"کد خطا: {test_response.status_code}", None
-                    
-            finally:
-                # بستن پروسه V2Ray
-                try:
-                    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-                    process.wait(timeout=5)
-                except:
-                    try:
-                        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-                    except:
-                        pass
-                
-                # حذف فایل کانفیگ موقت
-                try:
-                    os.unlink(config_file)
-                except:
-                    pass
-                    
-        except Exception as e:
-            return False, f"خطا: {str(e)}", None
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                process.wait(timeout=5)
+            except (ProcessLookupError, PermissionError):
+                pass
+            except Exception:
+                 os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        if tmp_config_file and os.path.exists(tmp_config_file):
+            os.remove(tmp_config_file)
+
+def main():
+    """اجرای تست کامل"""
+    print("=== شروع تست پروکسی‌ها ===")
     
-    def test_proxies_parallel(self, proxy_list, max_workers=20):
-        """تست موازی پروکسی‌ها"""
-        print(f"شروع تست {len(proxy_list)} پروکسی با {max_workers} thread...")
-        
-        working_proxies = []
-        
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # ارسال تسک‌ها
-            future_to_proxy = {
-                executor.submit(self.test_proxy_connection, proxy): proxy 
-                for proxy in proxy_list
-            }
-            
-            # دریافت نتایج
-            for i, future in enumerate(as_completed(future_to_proxy)):
-                proxy = future_to_proxy[future]
-                try:
-                    success, message, delay = future.result()
-                    if success:
-                        working_proxies.append({
-                            'url': proxy,
-                            'delay': delay,
-                            'message': message
-                        })
-                        print(f"✓ [{i+1}/{len(proxy_list)}] کارکرد: {message}")
-                    else:
-                        print(f"✗ [{i+1}/{len(proxy_list)}] ناکارآمد: {message}")
-                except Exception as e:
-                    print(f"✗ [{i+1}/{len(proxy_list)}] خطا: {e}")
-        
-        # مرتب‌سازی بر اساس تاخیر
-        working_proxies.sort(key=lambda x: x['delay'])
-        return working_proxies
+    proxy_list = fetch_proxy_lists(SUBSCRIPTION_URLS)
+    if not proxy_list:
+        print("هیچ پروکسی‌ای برای تست یافت نشد!")
+        return
+
+    print(f"\nشروع تست {len(proxy_list)} پروکسی با {MAX_WORKERS} ترد...")
+    working_proxies = []
     
-    def save_working_proxies(self, working_proxies, filename='working_proxies.txt'):
-        """ذخیره پروکسی‌های کارآمد"""
-        with open(filename, 'w', encoding='utf-8') as f:
-            f.write(f"# پروکسی‌های کارآمد - آخرین بروزرسانی: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"# تعداد: {len(working_proxies)}\n\n")
-            
-            for proxy in working_proxies:
-                f.write(f"# تاخیر: {proxy['delay']}ms\n")
-                f.write(f"{proxy['url']}\n\n")
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_proxy = {executor.submit(test_proxy_connection, proxy, CONNECTION_TIMEOUT): proxy for proxy in proxy_list}
         
-        print(f"پروکسی‌های کارآمد در {filename} ذخیره شدند")
+        for i, future in enumerate(as_completed(future_to_proxy)):
+            proxy_url = future_to_proxy[future]
+            ps_name = "نامشخص"
+            try:
+                parsed = parse_proxy_url(proxy_url)
+                if parsed and parsed.get('ps'):
+                    ps_name = parsed['ps']
+
+                success, message, delay = future.result()
+                
+                status_symbol = "✓" if success else "✗"
+                print(f"{status_symbol} [{i+1}/{len(proxy_list)}] {ps_name[:30]:<30} | {message}")
+
+                if success:
+                    working_proxies.append({'url': proxy_url, 'delay': delay, 'ps': ps_name})
+            except Exception as e:
+                print(f"✗ [{i+1}/{len(proxy_list)}] {ps_name[:30]:<30} | خطا در اجرای تست: {e}")
+
+    working_proxies.sort(key=lambda x: x['delay'])
     
-    def run_test(self):
-        """اجرای تست کامل"""
-        print("=== شروع تست پروکسی‌ها ===")
+    # ذخیره نتایج
+    output_filename = 'working_proxies.txt'
+    with open(output_filename, 'w', encoding='utf-8') as f:
+        f.write(f"# پروکسی‌های کارآمد - آخرین بروزرسانی: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"# تعداد: {len(working_proxies)}\n\n")
         
-        # دریافت لیست پروکسی‌ها
-        proxy_list = self.fetch_proxy_lists()
-        if not proxy_list:
-            print("هیچ پروکسی‌ای یافت نشد!")
-            return
-        
-        # تست پروکسی‌ها
-        working_proxies = self.test_proxies_parallel(proxy_list)
-        
-        # ذخیره نتایج
-        self.save_working_proxies(working_proxies)
-        
-        print(f"=== تست تکمیل شد ===")
-        print(f"تعداد کل پروکسی‌ها: {len(proxy_list)}")
-        print(f"تعداد پروکسی‌های کارآمد: {len(working_proxies)}")
-        
-        if working_proxies:
-            best_proxy = working_proxies[0]
-            print(f"بهترین پروکسی: {best_proxy['delay']}ms")
+        for proxy in working_proxies:
+            f.write(f"# {proxy['ps']} (تاخیر: {proxy['delay']}ms)\n")
+            f.write(f"{proxy['url']}\n\n")
+    
+    print(f"\n=== تست تکمیل شد ===")
+    print(f"تعداد کل پروکسی‌های تست شده: {len(proxy_list)}")
+    print(f"تعداد پروکسی‌های کارآمد: {len(working_proxies)}")
+    print(f"نتایج در فایل {output_filename} ذخیره شد.")
+
+    if working_proxies:
+        best_proxy = working_proxies[0]
+        print(f"🚀 بهترین پروکسی: {best_proxy['ps']} با تاخیر {best_proxy['delay']}ms")
 
 if __name__ == "__main__":
-    tester = V2RayTester()
-    tester.run_test()
+    main()
 EOF
 
 # ساخت اسکریپت اصلی
@@ -341,11 +331,14 @@ chmod +x test_proxies.py run_tester.sh
 
 # نصب cron job برای اجرای هر ۳ ساعت
 echo "راه‌اندازی cron job..."
+(crontab -l 2>/dev/null | grep -v "v2ray-tester") | crontab -
 (crontab -l 2>/dev/null; echo "0 */3 * * * cd ~/v2ray-tester && ./run_tester.sh >> ~/v2ray-tester/test.log 2>&1") | crontab -
 
-echo "=== نصب تکمیل شد ==="
+echo "=== نصب با موفقیت تکمیل شد ==="
+echo "اسکریپت شما اکنون از پروتکل‌های vmess, vless, trojan و shadowsocks پشتیبانی می‌کند."
+echo ""
 echo "فایل‌های ساخته شده:"
-echo "- ~/v2ray-tester/test_proxies.py (اسکریپت اصلی)"
+echo "- ~/v2ray-tester/test_proxies.py (اسکریپت اصلی پایتون)"
 echo "- ~/v2ray-tester/run_tester.sh (اسکریپت اجرا)"
 echo "- ~/v2ray-tester/test.log (فایل لاگ)"
 echo "- ~/v2ray-tester/working_proxies.txt (پروکسی‌های کارآمد)"
@@ -353,4 +346,4 @@ echo ""
 echo "برای اجرای دستی:"
 echo "cd ~/v2ray-tester && ./run_tester.sh"
 echo ""
-echo "cron job هر ۳ ساعت اجرا می‌شود"
+echo "cron job به صورت خودکار هر ۳ ساعت یکبار اجرا خواهد شد."
